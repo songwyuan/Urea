@@ -1,0 +1,255 @@
+## LGTV_CTVM20 - 蜱虫病毒感染RNA-Seq分析
+# Struction
+```
+/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20
+│
+├── README.md                           # 项目说明文档
+├── LICENSE                             # 许可证
+├── .gitignore                          # Git忽略文件
+│
+├── data/
+│   ├── raw/
+│   │   ├── GSE85300/                   # 公共数据集（蜱虫病毒研究）
+│   │   │   ├── raw_sra/                # SRA原始数据
+│   │   │   │   ├── SRR4011148/
+│   │   │   │   ├── SRR4011149/
+│   │   │   │   └── ...
+│   │   │   ├── fastq_files/            # 转换后的fastq文件
+│   │   │   └── README_GSE85300.md      # 数据集说明
+│   │   │
+│   │   └── IDE8-LGTV/                  # 实验数据（IDE8 vs LGTV感染）
+│   │       ├── IDE8-1_R1.fq.gz         # 样本文件（重复1-3）
+│   │       ├── IDE8-1_R2.fq.gz
+│   │       └── ...
+│   │
+│   ├── processed/
+│   │   ├── QC_results/                 # 质控结果
+│   │   ├── aligned_bams/               # 比对结果
+│   │   └── counts/                     # 基因计数矩阵
+│   │
+│   └── reference/
+│       ├── Ixodes_scapularis_gca016920785v2.ASM1692078v2.dna.toplevel.fa
+│       ├── Ixodes_scapularis.gtf
+│       └── Ixodes_scapularis.clean.gtf
+│
+├── scripts/
+│   ├── 01_data_download.sh             # 数据下载脚本
+│   ├── 02_quality_control.sh           # 质控脚本（基于qc.sh）
+│   ├── 03_alignment.sh                 # 比对脚本（基于align_count.sh）
+│   ├── 04_count_matrix.sh              # 计数矩阵生成
+│   ├── 05_deseq2_analysis.R            # 差异表达分析（基于DESeq2.R）
+│   └── utils/
+│       └── config.sh                   # 配置文件（路径和参数）
+│
+├── analysis/
+│   ├── notebooks/
+│   │   ├── 01_quality_metrics.ipynb    # 质控指标分析
+│   │   ├── 02_alignment_stats.ipynb    # 比对统计
+│   │   └── 03_deg_analysis.ipynb       # 差异表达分析
+│   │
+│   └── reports/
+│       ├── QC_report.html              # 质控报告
+│       ├── alignment_summary.html      # 比对总结
+│       └── DEG_report.html             # 差异表达报告
+│
+├── results/
+│   ├── differential_expression/
+│   │   ├── IDE8_vs_LGTV/
+│   │   │   ├── DEG_results.csv         # 差异基因列表
+│   │   │   ├── volcano_plot.png        # 火山图
+│   │   │   └── heatmap.png             # 热图
+│   │   └── GSE85300_analysis/          # 公共数据集分析
+│   │
+│   ├── enrichment/
+│   │   ├── GO_enrichment/
+│   │   └── KEGG_pathways/
+│   │
+│   └── supplementary/
+│       └── literature_data/            # 文献补充数据
+│           ├── Supplementary_Data_1.txt
+│           ├── Supplementary_Data_2.txt
+│           └── ...
+│
+├── docs/
+│   ├── methods.md                      # 实验方法
+│   ├── sample_info.csv                 # 样本信息表
+│   └── references.bib                  # 参考文献
+│
+└── environment/
+    ├── environment.yml                 # Conda环境
+    ├── Dockerfile                      # Docker容器
+    └── requirements.txt                # Python依赖
+```
+
+
+# qc.sh 
+```
+#!/bin/bash
+#PBS -cwd -V
+#PBS -l cpu=48:mem=120G
+#PBS -q fast
+#PBS -N LGTV_IDE8_QC_align
+
+set -euo pipefail
+
+WORKDIR="/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV"
+cd $WORKDIR
+
+mkdir -p results/QC results/bam results/counts results/logs results/star_index
+
+echo "== Step1: Fastp QC =="
+for s in IDE8-1 IDE8-2 IDE8-3 LGTV-1 LGTV-2 LGTV-3
+do
+  echo "Processing $s ..."
+  fastp -w 16 \
+    -i ${s}_R1.fq.gz -I ${s}_R2.fq.gz \
+    -o results/QC/${s}_R1.clean.fq.gz -O results/QC/${s}_R2.clean.fq.gz \
+    -h results/QC/${s}.html -j results/QC/${s}.json \
+    > results/logs/${s}_fastp.log 2>&1
+done
+echo "✔ Fastp completed!"
+
+echo "== Step2: STAR alignment =="
+for s in IDE8-1 IDE8-2 IDE8-3 LGTV-1 LGTV-2 LGTV-3
+do
+  STAR --runThreadN 48 \
+    --genomeDir results/star_index \
+    --readFilesIn results/QC/${s}_R1.clean.fq.gz results/QC/${s}_R2.clean.fq.gz \
+    --readFilesCommand zcat \
+    --outFileNamePrefix results/bam/${s}_ \
+    --outSAMtype BAM SortedByCoordinate \
+    > results/logs/${s}_align.log 2>&1
+done
+echo "✔ STAR alignment completed!"
+
+echo "🎉 QC & Alignment Finished Successfully!"
+```
+
+# STAR索引建立
+```
+#!/bin/bash
+#PBS -cwd -V
+#PBS -l cpu=48:mem=120G
+#PBS -q fast
+#PBS -N LGTV_align_count
+
+cd /mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV
+
+# 目录检查
+mkdir -p results/bam results/counts results/logs results/star_index
+
+# 1. Build STAR index
+if [ ! -f results/star_index/Genome ]; then
+    STAR --runThreadN 48 \
+        --runMode genomeGenerate \
+        --genomeDir results/star_index \
+        --genomeFastaFiles /mnt/alamo01/users/yuansongwei7/reference/genome.fa \
+        --sjdbGTFfile /mnt/alamo01/users/yuansongwei7/reference/genome.gtf \
+        --sjdbOverhang 149 \
+        > results/logs/star_index.log 2>&1
+fi
+
+# 2. STAR alignment
+for s in IDE8-1 IDE8-2 IDE8-3 LGTV-1 LGTV-2 LGTV-3
+do
+  STAR --runThreadN 48 \
+    --genomeDir results/star_index \
+    --readFilesIn results/QC/${s}_R1.clean.fq.gz results/QC/${s}_R2.clean.fq.gz \
+    --readFilesCommand zcat \
+    --outFileNamePrefix results/bam/${s}_ \
+    --outSAMtype BAM SortedByCoordinate \
+    --quantMode GeneCounts \
+    > results/logs/${s}_STAR.log 2>&1
+done
+
+# 3. featureCounts (更可信计数)
+featureCounts -T 48 -p -t exon -g gene_id \
+  -a /mnt/alamo01/users/yuansongwei7/reference/genome.gtf \
+  -o results/counts/IDE8_LGTV_counts.txt \
+  results/bam/*_Aligned.sortedByCoord.out.bam \
+  > results/logs/featureCounts.log 2>&1
+
+echo "🎯 Alignment + Counting finished!"
+```
+# STAR比对
+```
+#!/bin/bash
+
+# ===== Modify paths (已全部替换为真实路径) =====
+REF_GENOME=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV/reference/Ixodes_scapularis_gca016920785v2.ASM1692078v2.dna.toplevel.fa
+REF_GTF=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV/reference/Ixodes_scapularis_gca016920785v2.ASM1692078v2.62.gff3
+FASTQ_DIR=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV
+OUTDIR=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/STAR_out
+
+mkdir -p $OUTDIR/index $OUTDIR/align $OUTDIR/log
+
+echo "== Step1: Build STAR Index =="
+STAR --runThreadN 96 \
+    --runMode genomeGenerate \
+    --genomeDir $OUTDIR/index \
+    --genomeFastaFiles $REF_GENOME \
+    --sjdbGTFfile $REF_GTF \
+    --sjdbOverhang 149
+
+echo "== Step2: Mapping =="
+cd $FASTQ_DIR
+for r1 in *_R1.fq.gz; do
+    sample=${r1%_R1.fq.gz}
+    r2=${sample}_R2.fq.gz
+
+    echo ">>> Mapping: $sample"
+
+    STAR --runThreadN 96 \
+        --genomeDir $OUTDIR/index \
+        --readFilesIn $r1 $r2 \
+        --readFilesCommand zcat \
+        --outFileNamePrefix $OUTDIR/align/${sample}_ \
+        --outSAMtype BAM SortedByCoordinate \
+        --quantMode GeneCounts \
+        --limitBAMsortRAM 60000000000 \
+        &> $OUTDIR/log/${sample}.log
+done
+
+echo "== All Done =="
+
+```
+# DESeq2.R
+```
+#!/usr/bin/env Rscript
+
+library("DESeq2")
+
+# -----------------------------
+# 1. 文件路径
+# -----------------------------
+count_file <- "/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/results/counts/counts_matrix_clean.txt"
+
+# -----------------------------
+# 2. 读取计数矩阵
+# -----------------------------
+countData <- read.table(count_file, header = TRUE, row.names = 1, sep = "\t", check.names = FALSE)
+
+# -----------------------------
+# 3. 样本信息 (colData)
+# -----------------------------
+samples <- data.frame(
+  row.names = colnames(countData),
+  condition = c(rep("Mock", 3), rep("LGTV", 3))  # 前3列 Mock, 后3列 LGTV
+)
+
+# -----------------------------
+# 4. 构建 DESeq2 数据集
+# -----------------------------
+dds <- DESeqDataSetFromMatrix(countData = countData,
+                              colData = samples,
+                              design = ~ condition)
+
+# -----------------------------
+# 5. 过滤低表达基因
+# -----------------------------
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# -----------------------------
+# 6. 运行差异分析
+# -----------------------------
+dds <- DESeq(dds)
