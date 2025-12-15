@@ -1,0 +1,128 @@
+# 通过转录组数据确认蜱虫体内正确的尿素循环的mRNA序列
+```
+## qc_non.sh
+#!/bin/bash
+set -euo pipefail
+
+############################################
+# IDE8 tick RNA-seq de novo transcriptome
+# Purpose:
+#   Identify Arg–Citrulline / urea-cycle-related genes
+#   in tick cells without reference genome
+#
+# Author: yuansongwei7
+############################################
+
+########################
+# 0. 基础设置
+########################
+
+WORKDIR="/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV"
+cd "$WORKDIR"
+
+# 结果目录结构（清晰、可复现）
+mkdir -p results/{QC,logs,assembly}
+
+########################
+# 1. Fastp 质量控制
+########################
+
+echo "== Step 1: fastp QC =="
+
+SAMPLES="IDE8-1 IDE8-2 IDE8-3 LGTV-1 LGTV-2 LGTV-3"
+
+for s in $SAMPLES
+do
+  echo "QC for $s ..."
+  fastp \
+    -i ${s}_R1.fq.gz \
+    -I ${s}_R2.fq.gz \
+    -o results/QC/${s}_R1.clean.fq.gz \
+    -O results/QC/${s}_R2.clean.fq.gz \
+    -w 16 \
+    -h results/QC/${s}.html \
+    -j results/QC/${s}.json \
+    > results/logs/${s}_fastp.log 2>&1
+done
+
+echo "✓ Step 1 finished: fastp QC completed"
+
+########################
+# 2. 合并 IDE8 clean reads
+########################
+# 生物学意义：
+#   只用 IDE8（未感染）数据
+#   最大化“蜱虫自身转录本”的完整性
+########################
+
+echo "== Step 2: Merge IDE8 clean reads =="
+
+cat \
+  results/QC/IDE8-1_R1.clean.fq.gz \
+  results/QC/IDE8-2_R1.clean.fq.gz \
+  results/QC/IDE8-3_R1.clean.fq.gz \
+  > results/assembly/IDE8_all_R1.clean.fq.gz
+
+cat \
+  results/QC/IDE8-1_R2.clean.fq.gz \
+  results/QC/IDE8-2_R2.clean.fq.gz \
+  results/QC/IDE8-3_R2.clean.fq.gz \
+  > results/assembly/IDE8_all_R2.clean.fq.gz
+
+echo "✓ Step 2 finished: IDE8 reads merged"
+
+########################
+# 3. Trinity de novo 组装
+########################
+# 核心步骤：
+#   从零拼出“蜱虫可能表达的所有转录本”
+########################
+
+echo "== Step 3: Trinity de novo assembly =="
+
+Trinity \
+  --seqType fq \
+  --left  results/assembly/IDE8_all_R1.clean.fq.gz \
+  --right results/assembly/IDE8_all_R2.clean.fq.gz \
+  --CPU 32 \
+  --max_memory 120G \
+  --output results/assembly/trinity_IDE8 \
+  > results/logs/trinity.log 2>&1
+
+echo "✓ Step 3 finished: Trinity assembly completed"
+
+########################
+# 4. ORF 预测（TransDecoder）
+########################
+# 生物学意义：
+#   将转录本 → 可能的蛋白
+#   后续所有“功能判断”都基于蛋白层面
+########################
+
+echo "== Step 4: TransDecoder ORF prediction =="
+
+cd results/assembly/trinity_IDE8
+
+TransDecoder.LongOrfs -t Trinity.fasta \
+  > ../../logs/transdecoder_longorfs.log 2>&1
+
+TransDecoder.Predict -t Trinity.fasta \
+  > ../../logs/transdecoder_predict.log 2>&1
+
+echo "✓ Step 4 finished: ORF prediction completed"
+
+########################
+# 5. 提示后续分析
+########################
+
+echo "======================================"
+echo "ALL STEPS FINISHED SUCCESSFULLY"
+echo ""
+echo "Key outputs:"
+echo "  1) Transcriptome: results/assembly/trinity_IDE8/Trinity.fasta"
+echo "  2) Proteins:     Trinity.fasta.transdecoder.pep"
+echo ""
+echo "Next step:"
+echo "  BLAST search ASS / ASL / NOS / ARG proteins"
+echo "======================================"
+```
