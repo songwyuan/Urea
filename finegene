@@ -1,4 +1,6 @@
 # 通过转录组数据确认蜱虫体内正确的尿素循环的mRNA序列
+## 适用于非模式生物（无可靠参考基因组，仅做de novotranscriptome）
+
 ```
 ## qc_non.sh
 #!/bin/bash
@@ -71,11 +73,15 @@ cat \
 
 echo "✓ Step 2 finished: IDE8 reads merged"
 
-########################
+```
+
 # 3. Trinity de novo 组装
+```
 ########################
 # 核心步骤：
 #   从零拼出“蜱虫可能表达的所有转录本”
+
+#  需要内存过大，需要分开进行（被KILL）
 ########################
 
 echo "== Step 3: Trinity de novo assembly =="
@@ -92,37 +98,136 @@ Trinity \
 echo "✓ Step 3 finished: Trinity assembly completed"
 
 ########################
+```
+
 # 4. ORF 预测（TransDecoder）
+```
 ########################
 # 生物学意义：
 #   将转录本 → 可能的蛋白
 #   后续所有“功能判断”都基于蛋白层面
 ########################
 
-echo "== Step 4: TransDecoder ORF prediction =="
+#!/bin/bash
+#$ -cwd
+#$ -V
+#$ -S /bin/bash
 
-cd results/assembly/trinity_IDE8
+set -euo pipefail
 
-TransDecoder.LongOrfs -t Trinity.fasta \
-  > ../../logs/transdecoder_longorfs.log 2>&1
+# 初始化 micromamba（关键）
+source /home/yuansongwei7/.bashrc
 
-TransDecoder.Predict -t Trinity.fasta \
-  > ../../logs/transdecoder_predict.log 2>&1
+WORKDIR=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV
+ASSEMBLY=$WORKDIR/results/assembly
+
+cd $ASSEMBLY
+
+micromamba activate rnaseq
+
+TransDecoder.LongOrfs \
+  -t trinity_IDE8.Trinity.fasta
+
+TransDecoder.Predict \
+  -t trinity_IDE8.Trinity.fasta
 
 echo "✓ Step 4 finished: ORF prediction completed"
-
-########################
-# 5. 提示后续分析
-########################
-
-echo "======================================"
-echo "ALL STEPS FINISHED SUCCESSFULLY"
-echo ""
-echo "Key outputs:"
-echo "  1) Transcriptome: results/assembly/trinity_IDE8/Trinity.fasta"
-echo "  2) Proteins:     Trinity.fasta.transdecoder.pep"
-echo ""
-echo "Next step:"
-echo "  BLAST search ASS / ASL / NOS / ARG proteins"
-echo "======================================"
 ```
+
+## 通过人的蛋白质库blast注释转录本信息
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========== 路径 ==========
+HUMAN_PROT=/mnt/alamo01/users/yuansongwei7/ref/human_swissprot.faa
+
+IDE8_PEP=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV/results/assembly/trinity_IDE8_final/IDE8.transdecoder.pep
+IDE8_DB=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV/results/assembly/trinity_IDE8_final/IDE8_protein_db
+
+OUT_BASE=/mnt/alamo01/users/yuansongwei7/LGTV_CTVM20/IDE8-LGTV
+OUT=$OUT_BASE/IDE8_annotation
+IDE8_MAP_OUT=$OUT_BASE/IDE8_protein_to_transcript.tsv
+
+THREADS=32
+
+mkdir -p "$OUT"
+
+# ========== 0. 构建 protein → transcript 映射 ==========
+awk '
+/^>/ {
+  gsub(/^>/,"",$1)
+  split($1,a,".")
+  print $1"\t"a[1]
+}
+' "$IDE8_PEP" > "$IDE8_MAP_OUT"
+
+# ========== 1. blastp ==========
+blastp \
+  -query "$HUMAN_PROT" \
+  -db "$IDE8_DB" \
+  -evalue 1e-5 \
+  -max_target_seqs 5 \
+  -outfmt "6 qseqid sseqid pident length qlen slen evalue bitscore stitle" \
+  -num_threads "$THREADS" \
+  -out "$OUT/human_vs_IDE8.blastp.tsv"
+
+# ========== 2. 选每个 IDE8 protein 的 best human hit ==========
+awk '
+{
+  prot=$2
+  if (!(prot in best) || $8 > best[prot]) {
+    best[prot]=$8
+    hit[prot]=$1"\t"$3"\t"$4"\t"$5"\t"$6"\t"$8"\t"$9
+  }
+}
+END {
+  for (p in hit) print p"\t"hit[p]
+}
+' "$OUT/human_vs_IDE8.blastp.tsv" > "$OUT/IDE8_protein.best_annot.tsv"
+
+# ========== 3. protein → transcript 映射，生成最终转录本注释表 ==========
+awk '
+BEGIN {
+  while ((getline < "'$IDE8_MAP_OUT'") > 0) map[$1]=$2
+}
+{
+  prot=$1
+  tx=map[prot]
+  print tx"\t"$0
+}
+' "$OUT/IDE8_protein.best_annot.tsv" > "$OUT/IDE8_transcript_annotation.tsv"
+
+echo "[INFO] IDE8 Swiss-Prot annotation finished"
+
+```
+
+## 通过人的蛋白质blast我们的转录本预测蛋白质库，进行转录本的功能注释，提取相关转录本序列（全场not cds）
+
+#!/usr/bin/env bash
+set -euo pipefail
+blastp \
+-query ASS1.faa \
+-db ../../IDE8_protein_db \
+-evalue 1e-5 \
+-outfmt "6 qseqid sseqid pident length evalue bitscore qstart qend sstart send" \
+-num_threads 16 \
+-max_target_seqs 1 \
+-out ASS1_vs_IDE8_protein.best.tsv
+
+cut -f2 ASS1_vs_IDE8_protein.best.tsv | sed 's/\.p[0-9]\+$//' > ASS1_ids.txt
+awk '
+ BEGIN {
+    while ((getline < "ASS1_ids.txt") > 0) ids[$1] = 1
+  }
+  /^>/ {
+     name = substr($1, 2)
+    keep = (name in ids)
+  }
+  keep { print }
+' ../../Trinity.fasta > IDE8-ASS1.fna
+echo "[INFO]done"
+
+
+```
+
